@@ -46,7 +46,7 @@ WISHLIST_BASE_URL   = "https://www.bdgest.com/online/wishlist"
 BEDETHEQUE_BASE     = "https://www.bedetheque.com"
 
 # Polite delay between HTTP requests (seconds).
-REQUEST_DELAY = 1.5
+REQUEST_DELAY = 0.75
 
 HEADERS = {
     "User-Agent": (
