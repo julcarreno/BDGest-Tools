@@ -364,7 +364,7 @@ def job_finish(job_id):
 
 # ── Background search worker ───────────────────────────────────────────────────
 
-def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
+def run_search(job_id, cache_key, priority_ids, wishlist_url_str):
     try:
         session = requests.Session()
 
@@ -385,8 +385,6 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
 
         priority_series = {sid: info for sid, info in series_map.items()
                            if sid in priority_ids}
-        bonus_series    = {sid: info for sid, info in series_map.items()
-                           if sid not in priority_ids} if do_bonus else {}
 
         wishlist_by_series = defaultdict(list)
         for aid, item in wishlist_by_album_id.items():
@@ -394,17 +392,14 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
 
         total = len(priority_series)
         done  = 0
-
         sellers_found           = set()
         seller_priority_matches = defaultdict(list)
-        seller_bonus_matches    = defaultdict(list)
 
         job_emit(job_id, "progress", {
             "done": 0, "total": total,
             "msg": f"Starting search across {total} priority series…"
         })
 
-        # ── Phase A: Priority series (same as before) ──────────────────────────
         for series_id, info in priority_series.items():
             wanted = wishlist_by_series.get(series_id, [])
             if not wanted:
@@ -438,12 +433,12 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
                 album_id = resolve_album_id(sale["sale_url"], session)
                 if not album_id:
                     job_emit(job_id, "status", {"msg": f"  → no album ID found on page: {sale['sale_url']}"})
-                    continue   # could not resolve — skip rather than guess
+                    continue
 
                 confirmed = wishlist_by_album_id.get(album_id)
                 if not confirmed:
                     job_emit(job_id, "status", {"msg": f"  → album {album_id} not on wishlist"})
-                    continue   # album exists but is not on the wishlist
+                    continue
 
                 job_emit(job_id, "status", {"msg": f"  → MATCH: album {album_id} = {confirmed['album_title']}"})
                 sale["album_id"] = album_id
@@ -468,7 +463,7 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
                     "match":    match,
                     "priority": True,
                     "seller_priority_count": len(seller_priority_matches[vendeur]),
-                    "seller_bonus_count":    len(seller_bonus_matches[vendeur]),
+                    "seller_bonus_count":    0,
                 })
 
             done += 1
@@ -477,108 +472,11 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
                 "msg": f"Done: {info['name']}"
             })
 
-        # ── Phase B: Bonus search ──────────────────────────────────────────────
-        # For each vendor found in Phase A, fetch all their listings once, then
-        # filter in Python to rows that belong to a non-priority wishlist series,
-        # then resolve the exact album ID and confirm against the wishlist.
-        if do_bonus and sellers_found and bonus_series:
-
-            # album_ids already confirmed as priority — don't double-report
-            confirmed_album_ids = {
-                m["album_id"]
-                for matches in seller_priority_matches.values()
-                for m in matches
-                if m["album_id"]
-            }
-
-            # Build a normalised lookup: series_norm -> (sid, info, [wanted_items])
-            # so we can quickly check whether a vendor listing belongs to a bonus series
-            bonus_series_norm = {}
-            for sid2, info2 in bonus_series.items():
-                wanted2 = wishlist_by_series.get(sid2, [])
-                if wanted2:
-                    key = normalise(info2["name"].split(" - ")[0])
-                    bonus_series_norm[key] = (sid2, info2, wanted2)
-
-            if bonus_series_norm:
-                vendor_list = sorted(sellers_found)
-                job_emit(job_id, "progress", {
-                    "done": 0, "total": len(vendor_list),
-                    "msg": f"Bonus: scanning {len(vendor_list)} seller(s) for non-priority wishlist series…"
-                })
-
-                for v_idx, vendeur in enumerate(vendor_list):
-                    job_emit(job_id, "progress", {
-                        "done": v_idx, "total": len(vendor_list),
-                        "msg": f"Bonus: fetching all listings for {vendeur}…"
-                    })
-
-                    # One fetch of all vendor listings
-                    vendor_sales = get_all_sales_for_vendor(vendeur, session)
-
-                    # Group vendor listings by normalised series name
-                    vendor_by_series = defaultdict(list)
-                    for vsale in vendor_sales:
-                        # series name is everything before the " -tome- " token
-                        series_part = re.split(r"\s+-[^-]+-\s+", vsale["raw_title"])[0].strip()
-                        vendor_by_series[normalise(series_part)].append(vsale)
-
-                    # For each bonus wishlist series, check if vendor has any of it
-                    for series_norm_key, (sid2, info2, wanted2) in bonus_series_norm.items():
-                        vendor_listings = vendor_by_series.get(series_norm_key, [])
-                        if not vendor_listings:
-                            continue
-
-                        # Fuzzy-filter to candidates that match a wishlist album title
-                        candidates2 = []
-                        for vsale in vendor_listings:
-                            m = fuzzy_candidate(vsale, wanted2)
-                            if m:
-                                candidates2.append(vsale)
-
-                        # Phase 2: resolve exact album ID, confirm against wishlist
-                        for sale2 in candidates2:
-                            time.sleep(REQUEST_DELAY)
-                            album_id2 = resolve_album_id(sale2["sale_url"], session)
-                            if not album_id2 or album_id2 in confirmed_album_ids:
-                                continue
-
-                            confirmed2 = wishlist_by_album_id.get(album_id2)
-                            if confirmed2:
-                                confirmed_album_ids.add(album_id2)
-                                bonus = {
-                                    "sale_url":    sale2["sale_url"],
-                                    "album_title": sale2["raw_title"],
-                                    "series_name": info2["name"],
-                                    "wish_title":  confirmed2["album_title"],
-                                    "wish_url":    confirmed2.get("album_url", ""),
-                                    "prix":        sale2["prix"],
-                                    "etat":        sale2["etat"],
-                                    "eo":          sale2["eo"],
-                                    "album_id":    album_id2,
-                                    "vendeur":     vendeur,
-                                    "priority":    False,
-                                }
-                                seller_bonus_matches[vendeur].append(bonus)
-                                job_emit(job_id, "match", {
-                                    "vendeur":  vendeur,
-                                    "match":    bonus,
-                                    "priority": False,
-                                    "seller_priority_count": len(seller_priority_matches[vendeur]),
-                                    "seller_bonus_count":    len(seller_bonus_matches[vendeur]),
-                                })
-
-                    job_emit(job_id, "progress", {
-                        "done": v_idx + 1, "total": len(vendor_list),
-                        "msg": f"Bonus done: {vendeur}"
-                    })
-
         total_priority = sum(len(v) for v in seller_priority_matches.values())
-        total_bonus    = sum(len(v) for v in seller_bonus_matches.values())
         job_emit(job_id, "done", {
             "total_priority": total_priority,
-            "total_bonus":    total_bonus,
-            "sellers":        len(seller_priority_matches),
+            "total_bonus":    0,
+            "sellers":        list(sorted(sellers_found)),
         })
 
     except Exception as e:
@@ -586,7 +484,109 @@ def run_search(job_id, cache_key, priority_ids, wishlist_url_str, do_bonus):
     finally:
         job_finish(job_id)
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+
+def run_bonus(job_id, cache_key, vendeur, priority_ids):
+    """Fetch all listings for one vendor, match against non-priority wishlist series."""
+    try:
+        session = requests.Session()
+
+        if cache_key not in _wishlist_cache:
+            job_emit(job_id, "error", {"msg": "Wishlist not in cache — reload wishlist first."})
+            return
+
+        wishlist_by_album_id, series_map = _wishlist_cache[cache_key]
+
+        wishlist_by_series = defaultdict(list)
+        for aid, item in wishlist_by_album_id.items():
+            wishlist_by_series[item["series_id"]].append(item)
+
+        # Build normalised series lookup for non-priority wishlist series only
+        bonus_series_norm = {}
+        for sid, info in series_map.items():
+            if sid in priority_ids:
+                continue
+            wanted = wishlist_by_series.get(sid, [])
+            if wanted:
+                key = normalise(info["name"].split(" - ")[0])
+                bonus_series_norm[key] = (sid, info, wanted)
+
+        if not bonus_series_norm:
+            job_emit(job_id, "done", {
+                "total_priority": 0, "total_bonus": 0,
+                "sellers": [], "msg": "No non-priority wishlist series to search."
+            })
+            return
+
+        job_emit(job_id, "progress", {
+            "done": 0, "total": 1,
+            "msg": f"Fetching all listings for {vendeur}…"
+        })
+
+        vendor_sales = get_all_sales_for_vendor(vendeur, session)
+
+        job_emit(job_id, "progress", {
+            "done": 0, "total": 1,
+            "msg": f"Scanning {len(vendor_sales)} listings for wishlist matches…"
+        })
+
+        # Group by normalised series name
+        vendor_by_series = defaultdict(list)
+        for vsale in vendor_sales:
+            series_part = re.split(r"\s+-[^-]+-\s+", vsale["raw_title"])[0].strip()
+            vendor_by_series[normalise(series_part)].append(vsale)
+
+        confirmed_album_ids = set()
+        bonus_count = 0
+
+        for series_norm_key, (sid2, info2, wanted2) in bonus_series_norm.items():
+            vendor_listings = vendor_by_series.get(series_norm_key, [])
+            if not vendor_listings:
+                continue
+
+            candidates = [v for v in vendor_listings if fuzzy_candidate(v, wanted2)]
+
+            for sale2 in candidates:
+                time.sleep(REQUEST_DELAY)
+                album_id2 = resolve_album_id(sale2["sale_url"], session)
+                if not album_id2 or album_id2 in confirmed_album_ids:
+                    continue
+
+                confirmed2 = wishlist_by_album_id.get(album_id2)
+                if confirmed2:
+                    confirmed_album_ids.add(album_id2)
+                    bonus_count += 1
+                    bonus = {
+                        "sale_url":    sale2["sale_url"],
+                        "album_title": sale2["raw_title"],
+                        "series_name": info2["name"],
+                        "wish_title":  confirmed2["album_title"],
+                        "wish_url":    confirmed2.get("album_url", ""),
+                        "prix":        sale2["prix"],
+                        "etat":        sale2["etat"],
+                        "eo":          sale2["eo"],
+                        "album_id":    album_id2,
+                        "vendeur":     vendeur,
+                        "priority":    False,
+                    }
+                    job_emit(job_id, "match", {
+                        "vendeur":               vendeur,
+                        "match":                 bonus,
+                        "priority":              False,
+                        "seller_priority_count": 0,   # frontend already has this
+                        "seller_bonus_count":    bonus_count,
+                    })
+
+        job_emit(job_id, "progress", {"done": 1, "total": 1, "msg": f"Done — {bonus_count} bonus match(es) found."})
+        job_emit(job_id, "done", {
+            "total_priority": 0,
+            "total_bonus":    bonus_count,
+            "sellers":        [vendeur],
+        })
+
+    except Exception as e:
+        job_emit(job_id, "error", {"msg": f"Bonus search error: {e}"})
+    finally:
+        job_finish(job_id)
 
 @app.route("/")
 def index():
@@ -623,12 +623,11 @@ def api_wishlist():
 
 @app.route("/api/search/start", methods=["POST"])
 def api_search_start():
-    """Spawn a background search thread, return job_id immediately."""
+    """Spawn a background priority search thread, return job_id immediately."""
     body         = request.get_json(force=True)
     cache_key    = body.get("cache_key", "")
     priority_ids = set(body.get("priority", []))
     wishlist_url = body.get("url", DEFAULT_WISHLIST)
-    do_bonus     = bool(body.get("do_bonus", False))
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
@@ -636,11 +635,34 @@ def api_search_start():
 
     t = threading.Thread(
         target=run_search,
-        args=(job_id, cache_key, priority_ids, wishlist_url, do_bonus),
+        args=(job_id, cache_key, priority_ids, wishlist_url),
         daemon=True,
     )
     t.start()
+    return jsonify({"job_id": job_id})
 
+
+@app.route("/api/bonus/start", methods=["POST"])
+def api_bonus_start():
+    """Spawn a bonus search for one specific vendor."""
+    body         = request.get_json(force=True)
+    cache_key    = body.get("cache_key", "")
+    vendeur      = body.get("vendeur", "")
+    priority_ids = set(body.get("priority", []))
+
+    if not vendeur:
+        return jsonify({"error": "vendeur required"}), 400
+
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"events": [], "done": False}
+
+    t = threading.Thread(
+        target=run_bonus,
+        args=(job_id, cache_key, vendeur, priority_ids),
+        daemon=True,
+    )
+    t.start()
     return jsonify({"job_id": job_id})
 
 @app.route("/api/search/poll")
@@ -788,13 +810,21 @@ button.secondary:hover{border-color:var(--accent);color:var(--accent);}
 .match-eo-label{background:rgba(245,166,35,.15);border:1px solid rgba(245,166,35,.3);
   border-radius:4px;padding:1px 5px;}
 .hidden{display:none!important;}
-.bonus-toggle{display:flex;flex-direction:column;cursor:pointer;gap:0;color:var(--text);font-size:.82rem;}
-.bonus-toggle input[type=checkbox]{accent-color:var(--bonus);width:14px;height:14px;margin-right:.4rem;vertical-align:middle;}
-.bonus-toggle span:first-of-type{font-weight:600;}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);
   border-top-color:var(--accent);border-radius:50%;
   animation:spin .7s linear infinite;vertical-align:middle;margin-right:.4rem;}
 @keyframes spin{to{transform:rotate(360deg)}}
+button.bonus-btn{background:rgba(74,158,255,.12);border:1px solid rgba(74,158,255,.35);
+  color:var(--bonus);font-size:.72rem;padding:3px 10px;border-radius:999px;
+  letter-spacing:.04em;text-transform:uppercase;font-family:var(--font-head);font-weight:700;}
+button.bonus-btn:hover{background:rgba(74,158,255,.25);border-color:var(--bonus);}
+button.bonus-btn:disabled{opacity:.4;cursor:not-allowed;}
+button.bonus-btn.running{opacity:.6;}
+.step4-seller-list{display:flex;flex-direction:column;gap:.5rem;}
+.step4-seller-row{display:flex;align-items:center;gap:1rem;background:var(--surface2);
+  border:1px solid var(--border);border-radius:8px;padding:.6rem 1rem;}
+.step4-seller-row .sname{font-family:var(--font-head);font-weight:700;flex:1;font-size:.9rem;}
+.step4-seller-row .sdone{font-size:.75rem;color:var(--success);}
 </style>
 </head>
 <body>
@@ -832,15 +862,8 @@ button.secondary:hover{border-color:var(--accent);color:var(--accent);}
         <small id="series-sel-count"></small>
       </div>
       <div class="series-grid" id="series-grid"></div>
-      <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;">
+      <div style="margin-top:1.25rem;">
         <button id="btn-search">Search Sales</button>
-        <label class="bonus-toggle" title="For each seller found in priority results, also search all their other non-priority wishlist series using the same exact-match criteria">
-          <input type="checkbox" id="chk-bonus">
-          <span>Also search bonus series</span>
-          <span style="font-size:.72rem;color:var(--muted);display:block;margin-top:1px;">
-            Checks non-priority wishlist series from discovered sellers (slower)
-          </span>
-        </label>
       </div>
     </div>
     <div id="step2-placeholder" style="color:var(--muted);font-size:.85rem;">
@@ -879,7 +902,24 @@ button.secondary:hover{border-color:var(--accent);color:var(--accent);}
       Configure your search above.
     </div>
   </div>
-  <!-- Debug panel -->
+  <!-- Step 4: Bonus search -->
+  <div class="step hidden" id="step4">
+    <div class="step-header">
+      <div class="step-num" id="s4num">4</div>
+      <div class="step-title">Bonus Search</div>
+    </div>
+    <p style="font-size:.83rem;color:var(--muted);margin-bottom:1rem;">
+      Select a seller to scan all their listings for any other albums on your wishlist
+      (non-priority series), using the same exact-match criteria.
+    </p>
+    <div id="step4-seller-list" class="step4-seller-list"></div>
+    <div id="step4-progress" class="hidden" style="margin-top:1rem;">
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="bonus-progress-bar"></div>
+      </div>
+      <div class="status-log" id="bonus-status-log"></div>
+    </div>
+  </div>
   <div class="step" style="margin-top:1rem;">
     <div class="step-header" style="margin-bottom:.5rem;">
       <div class="step-title" style="font-size:.85rem;color:var(--muted);">Debug Log</div>
@@ -921,7 +961,8 @@ function loadCookie(){
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
-let cacheKey='', jobId=null, pollSince=0, pollTimer=null;
+let cacheKey='', priorityIds=[], jobId=null, pollSince=0, pollTimer=null;
+let bonusJobId=null, bonusPollSince=0, bonusPollTimer=null;
 let resultsMap={}, totalPriority=0, totalBonus=0;
 
 // ── Step 1 ────────────────────────────────────────────────────────────────
@@ -1011,8 +1052,10 @@ document.getElementById('btn-search').addEventListener('click', async ()=>{
   const ids=[...grid.querySelectorAll('input[type=checkbox]:checked')].map(cb=>cb.dataset.id);
   if(!ids.length){alert('Select at least one series.');return;}
   saveCookie(ids);
+  priorityIds=ids;
 
   if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+  if(bonusPollTimer){clearInterval(bonusPollTimer);bonusPollTimer=null;}
   resultsMap={}; totalPriority=0; totalBonus=0; jobId=null; pollSince=0;
   document.getElementById('sellers-container').innerHTML='';
   document.getElementById('total-priority-count').textContent='0';
@@ -1020,29 +1063,29 @@ document.getElementById('btn-search').addEventListener('click', async ()=>{
   document.getElementById('progress-bar').style.width='0%';
   document.getElementById('progress-text').textContent='';
   document.getElementById('status-log').textContent='';
-  hide('error-box');
+  document.getElementById('step4-seller-list').innerHTML='';
+  hide('step4'); hide('error-box');
 
   show('progress-panel'); show('results-panel'); hide('step3-placeholder');
   setActive(3);
   document.getElementById('s2num').classList.add('done');
 
   const wishlistUrl=document.getElementById('wishlist-url').value.trim();
-  const doBonus=document.getElementById('chk-bonus').checked;
-  dbg('Starting search. cacheKey=' + cacheKey + ' ids=' + ids.length + ' bonus=' + doBonus);
+  dbg('Starting search. cacheKey='+cacheKey+' ids='+ids.length);
   try{
     const res=await fetch('/api/search/start',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cache_key:cacheKey,priority:ids,url:wishlistUrl,do_bonus:doBonus})
+      body:JSON.stringify({cache_key:cacheKey,priority:ids,url:wishlistUrl})
     });
     const data=await res.json();
-    dbg('search/start response: ' + JSON.stringify(data));
+    dbg('search/start response: '+JSON.stringify(data));
     if(data.error)throw new Error(data.error);
     jobId=data.job_id; pollSince=0;
-    dbg('Poll timer starting for job ' + jobId);
+    dbg('Poll timer starting for job '+jobId);
     pollTimer=setInterval(poll,1000);
   }catch(e){
-    dbg('ERROR starting: ' + e.message);
+    dbg('ERROR starting: '+e.message);
     showErr('Failed to start search: '+e.message);
   }
 });
@@ -1070,6 +1113,116 @@ function showErr(msg){
   document.getElementById('status-log').textContent='⚠ '+msg;
 }
 
+// ── Step 4: seller bonus search ───────────────────────────────────────────
+function showStep4(sellers){
+  const list=document.getElementById('step4-seller-list');
+  list.innerHTML='';
+  sellers.forEach(vendeur=>{
+    const row=document.createElement('div');
+    row.className='step4-seller-row';
+    row.dataset.vendeur=vendeur;
+
+    const nm=document.createElement('div'); nm.className='sname';
+    const a=document.createElement('a');
+    a.href=`https://www.bedetheque.com/ventes/search?RechVendeur=${encodeURIComponent(vendeur)}`;
+    a.target='_blank'; a.textContent=vendeur; a.style.color='var(--text)';
+    nm.append('👤 ',a);
+
+    const btn=document.createElement('button');
+    btn.className='bonus-btn'; btn.textContent='Search bonus';
+    btn.addEventListener('click',()=>startBonusSearch(vendeur,btn));
+
+    row.appendChild(nm); row.appendChild(btn);
+    list.appendChild(row);
+  });
+  show('step4');
+  document.getElementById('step4').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+async function startBonusSearch(vendeur, btn){
+  if(bonusPollTimer){clearInterval(bonusPollTimer);bonusPollTimer=null;}
+  btn.disabled=true; btn.classList.add('running');
+  btn.textContent='Searching…';
+
+  show('step4-progress');
+  document.getElementById('bonus-progress-bar').style.width='0%';
+  document.getElementById('bonus-status-log').textContent=`Searching bonus for ${vendeur}…`;
+
+  try{
+    const res=await fetch('/api/bonus/start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cache_key:cacheKey,vendeur:vendeur,priority:priorityIds})
+    });
+    const data=await res.json();
+    if(data.error)throw new Error(data.error);
+    bonusJobId=data.job_id; bonusPollSince=0;
+    bonusPollTimer=setInterval(()=>pollBonus(vendeur,btn),1000);
+  }catch(e){
+    btn.disabled=false; btn.classList.remove('running'); btn.textContent='Search bonus';
+    document.getElementById('bonus-status-log').textContent='Error: '+e.message;
+  }
+}
+
+async function pollBonus(vendeur, btn){
+  if(!bonusJobId)return;
+  try{
+    const res=await fetch(`/api/search/poll?job_id=${bonusJobId}&since=${bonusPollSince}`);
+    const data=await res.json();
+    if(data.error){
+      document.getElementById('bonus-status-log').textContent='Error: '+data.error;
+      stopBonusPoll(btn); return;
+    }
+    data.events.forEach(ev=>handleBonusEvent(ev,vendeur));
+    bonusPollSince=data.next;
+    if(data.done) stopBonusPoll(btn, true);
+  }catch(e){
+    document.getElementById('bonus-status-log').textContent='Poll error: '+e.message;
+    stopBonusPoll(btn);
+  }
+}
+
+function stopBonusPoll(btn, success){
+  if(bonusPollTimer){clearInterval(bonusPollTimer);bonusPollTimer=null;}
+  if(btn){
+    btn.disabled=false; btn.classList.remove('running');
+    btn.textContent=success?'✓ Done':'Search bonus';
+  }
+}
+
+function handleBonusEvent(ev, vendeur){
+  const d=ev.data;
+  switch(ev.type){
+    case 'progress':
+      if(d.total>0)
+        document.getElementById('bonus-progress-bar').style.width=(d.done/d.total*100)+'%';
+      if(d.msg) document.getElementById('bonus-status-log').textContent=d.msg;
+      break;
+    case 'status':
+      document.getElementById('bonus-status-log').textContent=d.msg;
+      break;
+    case 'match':
+      // Append bonus match into the existing seller block in step 3
+      addMatch(d.vendeur,d.match,false,d.seller_priority_count,d.seller_bonus_count);
+      break;
+    case 'done':
+      document.getElementById('bonus-progress-bar').style.width='100%';
+      document.getElementById('bonus-status-log').textContent=
+        `Bonus complete — ${d.total_bonus} match(es) found for ${vendeur}.`;
+      // Mark this seller row as done in step 4
+      const row=document.querySelector(`.step4-seller-row[data-vendeur="${CSS.escape(vendeur)}"]`);
+      if(row){
+        const done=document.createElement('span');
+        done.className='sdone'; done.textContent=`✓ ${d.total_bonus} bonus found`;
+        row.appendChild(done);
+      }
+      break;
+    case 'error':
+      document.getElementById('bonus-status-log').textContent='Error: '+d.msg;
+      break;
+  }
+}
+
 function handleEvent(ev){
   dbg('event: ' + ev.type + ' ' + JSON.stringify(ev.data).slice(0,60));
   const d=ev.data;
@@ -1090,8 +1243,9 @@ function handleEvent(ev){
     case 'done':
       document.getElementById('progress-bar').style.width='100%';
       document.getElementById('status-log').textContent=
-        `Search complete — ${d.total_priority} priority, ${d.total_bonus} bonus matches across ${d.sellers} seller(s).`;
+        `Search complete — ${d.total_priority} priority match(es) across ${d.sellers.length} seller(s).`;
       document.getElementById('s3num').classList.add('done');
+      if(d.sellers && d.sellers.length>0) showStep4(d.sellers);
       break;
     case 'error':
       showErr(d.msg);
